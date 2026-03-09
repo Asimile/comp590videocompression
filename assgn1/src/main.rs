@@ -22,6 +22,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Make sure ffmpeg is installed
     ffmpeg_sidecar::download::auto_download().unwrap();
 
+    // ---------- NEW: helpers for circular residuals ----------
+    const CTX_TOP: usize = 0;     // top row uses prior frame
+    const CTX_ABOVE: usize = 1;   // other rows use pixel above in current frame
+    const NUM_RESIDUAL_CONTEXTS: usize = 2;
+
+    /// Circular 8-bit subtraction: (a - b) mod 256 -> u8
+    #[inline]
+    fn wrap_sub(a: u8, b: u8) -> u8 {
+        ((a as i32 - b as i32 + 256) & 0xFF) as u8
+    }
+
+    /// Fold circular diff into [0..255] with near-zero first:
+    /// 0->0, 1->1, 255->2, 2->3, 254->4, ...
+    #[inline]
+    fn fold_circular(u: u8) -> i32 {
+        if u == 0 {
+            0
+        } else if u <= 128 {
+            (2 * u as i32) - 1
+        } else {
+            2 * (256 - u as i32)
+        }
+    }
+
+    /// Inverse of fold_circular
+    #[inline]
+    fn unfold_circular(v: i32) -> u8 {
+        if v == 0 {
+            0
+        } else if v % 2 == 1 {
+            ((v + 1) / 2) as u8
+        } else {
+            (256 - (v / 2)) as u8
+        }
+    }
+    // ---------- END NEW helpers ----------
+
     // Command line options
     // -verbose, -no_verbose                Default: -no_verbose
     // -report, -no_report                  Default: -report
@@ -106,7 +143,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = Encoder::new();
 
     // Set up arithmetic coding context(s)
-    let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
     let mut residual_pdfs: Vec<VectorCountSymbolModel<i32>> = (0..NUM_RESIDUAL_CONTEXTS)
         .map(|_| VectorCountSymbolModel::new((0..=255).collect()))
         .collect();
@@ -123,22 +159,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let bits_written_at_start = enc.bits_written();
 
+            // ---------- NEW: reconstructed current frame buffer (per frame) ----------
+            let mut recon_curr_frame = vec![0u8; (width * height) as usize];
+            // ------------------------------------------------------------------------
+
             // Process pixels in row major order.
             for r in 0..height {
                 for c in 0..width {
-                    let pixel_index = (r * width + c) as usize;
+                    let idx = (r * width + c) as usize;
+                    let cur = current_frame[idx];
 
-                    // Encode difference with same pixel in prior frame.
-                    // Normalize and modulate difference to 8-bit range.
-                    let pixel_difference = (((current_frame[pixel_index] as i32)
-                        - (prior_frame[pixel_index] as i32))
-                        + 256)
-                        % 256;
+                    // Predictor:
+                    // - Top row: prior frame (temporal)
+                    // - Otherwise: pixel above from reconstructed current frame
+                    let (pred, ctx) = if r == 0 {
+                        (prior_frame[idx], CTX_TOP)
+                    } else {
+                        (recon_curr_frame[idx - width as usize], CTX_ABOVE)
+                    };
 
-                    enc.encode(&pixel_difference, &pixel_difference_pdf, &mut bw);
+                    // Residual and folded symbol
+                    let d = wrap_sub(cur, pred);
+                    let sym = fold_circular(d);
 
-                    // Update context
-                    pixel_difference_pdf.incr_count(&pixel_difference);
+                    // Encode and update context
+                    enc.encode(&sym, &residual_pdfs[ctx], &mut bw);
+                    residual_pdfs[ctx].incr_count(&sym);
+
+                    // Update reconstructed pixel (exactly equals cur)
+                    recon_curr_frame[idx] = cur;
                 }
             }
 
@@ -182,16 +231,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut dec = Decoder::new();
 
-        let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
         let mut residual_pdfs: Vec<VectorCountSymbolModel<i32>> = (0..NUM_RESIDUAL_CONTEXTS)
             .map(|_| VectorCountSymbolModel::new((0..=255).collect()))
             .collect();
 
-
         // Set up initial prior frame as uniform medium gray
         let mut prior_frame = vec![128 as u8; (width * height) as usize];
 
-        'outer_loop: 
+        'outer_loop:
         for frame in iter.filter_frames() {
             if frame.frame_num < skip_count + count {
                 if verbose {
@@ -200,27 +247,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
 
+                // ---------- NEW: reconstructed current frame buffer (per frame) ----------
+                let mut recon_curr_frame = vec![0u8; (width * height) as usize];
+                // ------------------------------------------------------------------------
+
                 // Process pixels in row major order.
                 for r in 0..height {
                     for c in 0..width {
-                        let pixel_index = (r * width + c) as usize;
-                        let decoded_pixel_difference = dec.decode(&pixel_difference_pdf, &mut br).to_owned();
-                        pixel_difference_pdf.incr_count(&decoded_pixel_difference);
+                        let idx = (r * width + c) as usize;
 
-                        let pixel_value = (prior_frame[pixel_index] as i32 + decoded_pixel_difference) % 256;
+                        // Predictor mirrors encoder
+                        let (pred, ctx) = if r == 0 {
+                            (prior_frame[idx], CTX_TOP)
+                        } else {
+                            (recon_curr_frame[idx - width as usize], CTX_ABOVE)
+                        };
 
-                        if pixel_value != current_frame[pixel_index] as i32 {
+                        // Decode folded residual and reconstruct
+                        let decoded_sym = dec.decode(&residual_pdfs[ctx], &mut br).to_owned();
+                        residual_pdfs[ctx].incr_count(&decoded_sym);
+
+                        let d = unfold_circular(decoded_sym);
+                        let pixel_value = ((pred as i32 + d as i32) & 0xFF) as u8;
+
+                        if pixel_value != current_frame[idx] {
                             println!(
                                 " error at ({}, {}), should decode {}, got {}",
-                                c, r, current_frame[pixel_index], pixel_value
+                                c, r, current_frame[idx], pixel_value
                             );
                             println!("Abandoning check of remaining frames");
                             break 'outer_loop;
                         }
+
+                        recon_curr_frame[idx] = pixel_value;
                     }
                 }
-                println!("correct.");
-                prior_frame = current_frame;
+                if verbose {
+                    println!("correct.");
+                }
+                prior_frame = recon_curr_frame;
             } else {
                 break 'outer_loop;
             }
