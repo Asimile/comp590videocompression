@@ -159,9 +159,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let bits_written_at_start = enc.bits_written();
 
-            // ---------- NEW: reconstructed current frame buffer (per frame) ----------
+            // Reconstructed current frame buffer (per frame)
             let mut recon_curr_frame = vec![0u8; (width * height) as usize];
-            // ------------------------------------------------------------------------
 
             // Process pixels in row major order.
             for r in 0..height {
@@ -170,8 +169,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let cur = current_frame[idx];
 
                     // Predictor:
-                    // - Top row: prior frame (temporal)
-                    // - Otherwise: pixel above from reconstructed current frame
+                    // - Top row: prior frame, same location
+                    // - Otherwise: pixel above from current frame
                     let (pred, ctx) = if r == 0 {
                         (prior_frame[idx], CTX_TOP)
                     } else {
@@ -247,9 +246,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
 
-                // ---------- NEW: reconstructed current frame buffer (per frame) ----------
+                // Reconstructed current frame buffer (per frame)
                 let mut recon_curr_frame = vec![0u8; (width * height) as usize];
-                // ------------------------------------------------------------------------
 
                 // Process pixels in row major order.
                 for r in 0..height {
