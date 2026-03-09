@@ -107,6 +107,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up arithmetic coding context(s)
     let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+    let mut residual_pdfs: Vec<VectorCountSymbolModel<i32>> = (0..NUM_RESIDUAL_CONTEXTS)
+        .map(|_| VectorCountSymbolModel::new((0..=255).collect()))
+        .collect();
+
 
     // Process frames
     for frame in iter.filter_frames() {
@@ -179,6 +183,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut dec = Decoder::new();
 
         let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+        let mut residual_pdfs: Vec<VectorCountSymbolModel<i32>> = (0..NUM_RESIDUAL_CONTEXTS)
+            .map(|_| VectorCountSymbolModel::new((0..=255).collect()))
+            .collect();
+
 
         // Set up initial prior frame as uniform medium gray
         let mut prior_frame = vec![128 as u8; (width * height) as usize];
